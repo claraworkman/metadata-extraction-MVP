@@ -18,6 +18,8 @@ from docx import Document
 from azure.ai.formrecognizer import DocumentAnalysisClient
 from azure.storage.blob import BlobServiceClient
 import io
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 load_dotenv()
 
@@ -55,6 +57,23 @@ else:
     blob_service_client = None
 
 DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
+
+# Parallel processing configuration
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "10"))  # Concurrent threads
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))   # Retry attempts per file
+RETRY_DELAY = float(os.getenv("RETRY_DELAY", "2")) # Seconds between retries
+
+# Thread-safe progress tracking
+class ProgressTracker:
+    def __init__(self, total):
+        self.total = total
+        self.completed = 0
+        self.lock = threading.Lock()
+    
+    def increment(self):
+        with self.lock:
+            self.completed += 1
+            return self.completed
 
 # Sirion metadata fields
 SIRION_FIELDS = [
@@ -213,10 +232,15 @@ def read_contract_file(file_path_or_data, extension=None):
             return None, f"Unsupported file format: {ext}"
 
 
-def extract_metadata_direct(contract_text, file_name=""):
+def extract_metadata_direct(contract_text, file_name="", attempt=1):
     """
     Extract metadata directly from original language contract
     No translation needed - GPT-4o-mini reads multiple languages
+    
+    Args:
+        contract_text: Full contract text
+        file_name: Filename for context
+        attempt: Current retry attempt (for logging)
     """
     
     user_prompt = f"""Extract metadata from this contract and return all values in ENGLISH:
@@ -245,10 +269,114 @@ Return JSON with the 12 required Sirion fields, plus source_language and confide
         return result, None
         
     except Exception as e:
-        return None, str(e)
+        error_msg = str(e)
+        if "rate" in error_msg.lower() or "429" in error_msg:
+            error_msg += " (Rate limit detected)"
+        return None, error_msg
 
 
-def process_contracts_from_blob(container_name, output_csv="sirion_metadata.csv"):
+def process_contract_with_retry(file_info, progress_tracker=None):
+    """
+    Process a single contract with retry logic
+    Designed for parallel execution
+    
+    Args:
+        file_info: Dict with 'name', 'data', 'extension'
+        progress_tracker: ProgressTracker instance for thread-safe counting
+    
+    Returns:
+        Dict with extraction results or error info
+    """
+    file_name = file_info['name']
+    file_data = file_info['data']
+    extension = file_info['extension']
+    
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            # Read contract file
+            contract_text, read_error = read_contract_file(file_data, extension)
+            
+            if not contract_text:
+                result = {
+                    'File Name': file_name,
+                    'Error': f"Read error: {read_error}"
+                }
+                if progress_tracker:
+                    completed = progress_tracker.increment()
+                    print(f"   [{completed}/{progress_tracker.total}] {file_name}: ❌ Read failed")
+                return result
+            
+            # Extract metadata
+            metadata, error = extract_metadata_direct(contract_text, file_name, attempt)
+            
+            if metadata:
+                # Build result row
+                row = {
+                    'File Name': file_name,
+                    'Source Language': metadata.get('source_language', 'unknown'),
+                    'Extraction Timestamp': metadata.get('extraction_timestamp', ''),
+                }
+                
+                # Add all 12 Sirion fields
+                for field in SIRION_FIELDS:
+                    row[field] = metadata.get(field, '')
+                
+                # Add quality indicators
+                row['Confidence'] = metadata.get('confidence', 'medium')
+                row['Notes'] = metadata.get('extraction_notes', '')
+                
+                if progress_tracker:
+                    completed = progress_tracker.increment()
+                    lang = metadata.get('source_language', 'unknown').upper()
+                    conf = metadata.get('confidence', 'medium')
+                    print(f"   [{completed}/{progress_tracker.total}] {file_name}: ✅ {lang}, {conf}")
+                
+                return row
+            
+            # Handle errors with retry logic
+            elif attempt < MAX_RETRIES and ("rate" in error.lower() or "429" in error):
+                # Rate limited - retry with exponential backoff
+                wait_time = RETRY_DELAY * (2 ** (attempt - 1))
+                if progress_tracker:
+                    print(f"   [{progress_tracker.completed}/{progress_tracker.total}] {file_name}: ⏸️ Rate limited, retrying in {wait_time}s (attempt {attempt}/{MAX_RETRIES})")
+                time.sleep(wait_time)
+                continue
+            else:
+                # Non-retryable error or max retries reached
+                result = {
+                    'File Name': file_name,
+                    'Error': error
+                }
+                if progress_tracker:
+                    completed = progress_tracker.increment()
+                    print(f"   [{completed}/{progress_tracker.total}] {file_name}: ❌ {error}")
+                return result
+                
+        except Exception as e:
+            if attempt < MAX_RETRIES:
+                wait_time = RETRY_DELAY * (2 ** (attempt - 1))
+                if progress_tracker:
+                    print(f"   [{progress_tracker.completed}/{progress_tracker.total}] {file_name}: ⏸️ Error, retrying in {wait_time}s")
+                time.sleep(wait_time)
+                continue
+            else:
+                result = {
+                    'File Name': file_name,
+                    'Error': str(e)
+                }
+                if progress_tracker:
+                    completed = progress_tracker.increment()
+                    print(f"   [{completed}/{progress_tracker.total}] {file_name}: ❌ {str(e)}")
+                return result
+    
+    # Should not reach here, but handle edge case
+    return {
+        'File Name': file_name,
+        'Error': 'Max retries exceeded'
+    }
+
+
+def process_contracts_from_blob(container_name, output_csv="sirion_metadata.csv", parallel=True):
     """
     Process all contracts from Azure Blob Storage and export to CSV
     Supports .txt, .docx, and .pdf files
@@ -287,80 +415,59 @@ def process_contracts_from_blob(container_name, output_csv="sirion_metadata.csv"
         print(f"📊 Files Found: {len(blobs)}")
         print(f"📄 Formats: .txt, .docx, .pdf (with OCR)")
         print(f"🤖 Model: {DEPLOYMENT_NAME}")
+        if parallel:
+            print(f"⚡ Parallel Mode: {MAX_WORKERS} concurrent workers")
+        else:
+            print(f"🐢 Sequential Mode: One at a time")
         print(f"💾 Output: {output_csv}")
         print(f"{'='*80}\n")
         
-        results = []
-        success_count = 0
-        error_count = 0
-        
-        for i, blob in enumerate(blobs, 1):
-            print(f"[{i}/{len(blobs)}] Processing: {blob.name}")
-            
+        # Prepare file info for processing
+        file_infos = []
+        for blob in blobs:
             try:
-                # Download blob data
                 blob_client = container_client.get_blob_client(blob.name)
                 blob_data = blob_client.download_blob().readall()
-                
-                # Get file extension
                 extension = Path(blob.name).suffix.lower()
                 
-                # Read contract file (handles .txt, .docx, .pdf)
-                contract_text, read_error = read_contract_file(blob_data, extension)
-                
-                if not contract_text:
-                    print(f"   ❌ Failed to read file: {read_error}")
-                    results.append({
-                        'File Name': blob.name,
-                        'Error': f"Read error: {read_error}"
-                    })
-                    error_count += 1
-                    continue
-                
-                # Extract metadata directly (no translation)
-                metadata, error = extract_metadata_direct(contract_text, blob.name)
-                
-                if metadata:
-                    # Build CSV row
-                    row = {
-                        'File Name': blob.name,
-                        'Source Language': metadata.get('source_language', 'unknown'),
-                        'Extraction Timestamp': metadata.get('extraction_timestamp', ''),
-                    }
-                    
-                    # Add all 12 Sirion fields
-                    for field in SIRION_FIELDS:
-                        row[field] = metadata.get(field, '')
-                    
-                    # Add quality indicators
-                    row['Confidence'] = metadata.get('confidence', 'medium')
-                    row['Notes'] = metadata.get('extraction_notes', '')
-                    
-                    results.append(row)
-                    success_count += 1
-                    
-                    detected_lang = metadata.get('source_language', 'unknown')
-                    confidence = metadata.get('confidence', 'medium')
-                    print(f"   ✅ Language: {detected_lang.upper()}, Confidence: {confidence}")
-                    
-                else:
-                    print(f"   ❌ Failed: {error}")
-                    results.append({
-                        'File Name': blob.name,
-                        'Error': error
-                    })
-                    error_count += 1
-                
-                # Rate limiting - avoid API throttling
-                time.sleep(0.5)
-                
-            except Exception as e:
-                print(f"   ❌ Error: {str(e)}")
-                results.append({
-                    'File Name': blob.name,
-                    'Error': str(e)
+                file_infos.append({
+                    'name': blob.name,
+                    'data': blob_data,
+                    'extension': extension
                 })
-                error_count += 1
+            except Exception as e:
+                print(f"❌ Failed to download {blob.name}: {str(e)}")
+                file_infos.append({
+                    'name': blob.name,
+                    'data': None,
+                    'extension': None
+                })
+        
+        # Process contracts (parallel or sequential)
+        results = []
+        progress = ProgressTracker(len(file_infos))
+        
+        if parallel and len(file_infos) > 1:
+            # Parallel processing
+            print(f"🚀 Processing {len(file_infos)} contracts in parallel...\n")
+            
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = {
+                    executor.submit(process_contract_with_retry, file_info, progress): file_info['name']
+                    for file_info in file_infos
+                }
+                
+                for future in as_completed(futures):
+                    results.append(future.result())
+        else:
+            # Sequential processing
+            print(f"Processing {len(file_infos)} contracts sequentially...\n")
+            for file_info in file_infos:
+                results.append(process_contract_with_retry(file_info, progress))
+        
+        # Count successes/failures
+        success_count = sum(1 for r in results if 'Error' not in r)
+        error_count = sum(1 for r in results if 'Error' in r)
         
         # Export to CSV (same as local version)
         if results:
@@ -434,7 +541,7 @@ def process_contracts_from_blob(container_name, output_csv="sirion_metadata.csv"
         return None
 
 
-def process_contracts_to_csv(input_folder, output_csv="sirion_metadata.csv"):
+def process_contracts_to_csv(input_folder, output_csv="sirion_metadata.csv", parallel=True):
     """
     Process all contracts and export to CSV
     Supports .txt, .docx, and .pdf files
@@ -442,6 +549,7 @@ def process_contracts_to_csv(input_folder, output_csv="sirion_metadata.csv"):
     Args:
         input_folder: Folder containing original contracts
         output_csv: Output CSV file name
+        parallel: Use parallel processing (default: True)
     """
     
     input_path = Path(input_folder)
@@ -466,73 +574,47 @@ def process_contracts_to_csv(input_folder, output_csv="sirion_metadata.csv"):
     print(f"📊 Files Found: {len(files)}")
     print(f"📄 Formats: .txt, .docx, .pdf (with OCR)")
     print(f"🤖 Model: {DEPLOYMENT_NAME}")
+    if parallel:
+        print(f"⚡ Parallel Mode: {MAX_WORKERS} concurrent workers")
+    else:
+        print(f"🐢 Sequential Mode: One at a time")
     print(f"💾 Output: {output_csv}")
     print(f"{'='*80}\n")
     
-    results = []
-    success_count = 0
-    error_count = 0
+    # Prepare file info for processing
+    file_infos = []
+    for file_path in files:
+        file_infos.append({
+            'name': file_path.name,
+            'data': str(file_path),  # Pass path as string
+            'extension': file_path.suffix.lower()
+        })
     
-    for i, file_path in enumerate(files, 1):
-        print(f"[{i}/{len(files)}] Processing: {file_path.name}")
+    # Process contracts
+    results = []
+    progress = ProgressTracker(len(file_infos))
+    
+    if parallel and len(file_infos) > 1:
+        # Parallel processing
+        print(f"🚀 Processing {len(file_infos)} contracts in parallel...\n")
         
-        try:
-            # Read contract file (handles .txt, .docx, .pdf)
-            contract_text, read_error = read_contract_file(file_path)
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(process_contract_with_retry, file_info, progress): file_info['name']
+                for file_info in file_infos
+            }
             
-            if not contract_text:
-                print(f"   ❌ Failed to read file: {read_error}")
-                results.append({
-                    'File Name': file_path.name,
-                    'Error': f"Read error: {read_error}"
-                })
-                error_count += 1
-                continue
-            
-            # Extract metadata directly (no translation)
-            metadata, error = extract_metadata_direct(contract_text, file_path.name)
-            
-            if metadata:
-                # Build CSV row
-                row = {
-                    'File Name': file_path.name,
-                    'Source Language': metadata.get('source_language', 'unknown'),
-                    'Extraction Timestamp': metadata.get('extraction_timestamp', ''),
-                }
-                
-                # Add all 12 Sirion fields
-                for field in SIRION_FIELDS:
-                    row[field] = metadata.get(field, '')
-                
-                # Add quality indicators
-                row['Confidence'] = metadata.get('confidence', 'medium')
-                row['Notes'] = metadata.get('extraction_notes', '')
-                
-                results.append(row)
-                success_count += 1
-                
-                detected_lang = metadata.get('source_language', 'unknown')
-                confidence = metadata.get('confidence', 'medium')
-                print(f"   ✅ Language: {detected_lang.upper()}, Confidence: {confidence}")
-                
-            else:
-                print(f"   ❌ Failed: {error}")
-                results.append({
-                    'File Name': file_path.name,
-                    'Error': error
-                })
-                error_count += 1
-            
-            # Rate limiting - avoid API throttling
-            time.sleep(0.5)
-            
-        except Exception as e:
-            print(f"   ❌ Error: {str(e)}")
-            results.append({
-                'File Name': file_path.name,
-                'Error': str(e)
-            })
-            error_count += 1
+            for future in as_completed(futures):
+                results.append(future.result())
+    else:
+        # Sequential processing
+        print(f"Processing {len(file_infos)} contracts sequentially...\n")
+        for file_info in file_infos:
+            results.append(process_contract_with_retry(file_info, progress))
+    
+    # Count successes/failures
+    success_count = sum(1 for r in results if 'Error' not in r)
+    error_count = sum(1 for r in results if 'Error' in r)
     
     # Export to CSV
     if results:
