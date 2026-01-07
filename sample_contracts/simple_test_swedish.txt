@@ -1,0 +1,25 @@
+ENKELT TESTDOKUMENT
+
+Detta är ett mycket enkelt testdokument för att verifiera översättningssystemet.
+
+FÖRETAGSINFORMATION:
+- Kund: Circle K Sverige AB
+- Leverantör: Test Företag AB
+- Avtalsdatum: 2024-01-15
+
+VIKTIGA DATUM:
+- Startdatum: 2024-02-01
+- Slutdatum: 2025-02-01
+- Uppsägningstid: 30 dagar
+
+EKONOMISKA VILLKOR:
+- Valuta: SEK (Svenska kronor)
+- Betalningsvillkor: 30 dagar netto
+- Årligt värde: 500 000 SEK
+
+JURIDISK INFORMATION:
+- Tillämplig lag: Svensk rätt
+- Avtalstyp: Ramavtal
+- Uppsägningsrätt: Båda parter kan säga upp avtalet
+
+Detta dokument är endast för testningsändamål.
