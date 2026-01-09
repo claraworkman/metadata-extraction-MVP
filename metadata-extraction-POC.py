@@ -56,7 +56,7 @@ if storage_account_name:
 else:
     blob_service_client = None
 
-DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
+DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-5-mini")
 
 # Parallel processing configuration
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "10"))  # Concurrent threads
