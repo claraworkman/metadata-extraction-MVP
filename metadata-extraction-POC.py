@@ -117,6 +117,22 @@ TRANSLATION EXAMPLES:
 - Polish "prawo polskie" → "Polish law"
 - Estonian "Eesti õigus" → "Estonian law"
 
+CRITICAL: NEVER leave Customer (CK) Entity or Supplier Entity empty. Search the entire contract for company names.
+
+FEW-SHOT EXAMPLES:
+
+Example 1 (Swedish evergreen contract):
+Input: "Circle K Sverige AB... Scandinavian Food Suppliers AB... träder i kraft den 1 april 2024... löper på obestämd tid... uppsägning med 90 dagars varsel..."
+Output: {"Customer (CK) Entity": "Circle K Sverige AB", "Supplier Entity": "Scandinavian Food Suppliers AB", "Effective Date": "2024-04-01", "Expiration Date": null, "Term Type": "Evergreen", "Governing Law": "Swedish law", "Contract Type": "Supply Agreement", "Contract Currency": "SEK", "Payment Term": "Net 60", "Termination for Convenience": "Yes", "Notice Period for Termination for Convenience": "90 days", "Party with the Right to Terminate for Convenience": "Both parties", "source_language": "sv", "confidence": "high"}
+
+Example 2 (Polish auto-renewing contract):
+Input: "Circle K Polska Sp. z o.o.... Polski Dostawca Żywności Sp. z o.o.... wchodzi w życie 1 kwietnia 2024... obowiązuje przez okres 24 miesięcy... automatycznie przedłuża się... wypowiedzenie z 60-dniowym wyprzedzeniem..."
+Output: {"Customer (CK) Entity": "Circle K Polska Sp. z o.o.", "Supplier Entity": "Polski Dostawca Żywności Sp. z o.o.", "Effective Date": "2024-04-01", "Expiration Date": "2026-04-01", "Term Type": "Fixed term with auto-renewal", "Governing Law": "Polish law", "Contract Type": "Supply Agreement", "Contract Currency": "PLN", "Payment Term": "Net 45", "Termination for Convenience": "Yes", "Notice Period for Termination for Convenience": "60 days", "Party with the Right to Terminate for Convenience": "Both parties", "source_language": "pl", "confidence": "high"}
+
+Example 3 (Estonian indefinite contract):
+Input: "Circle K Eesti AS... Eesti Toidutarnijad OÜ... jõustub 1. aprillil 2024... kehtib tähtajatult... võib lõpetada 60 päeva etteteatamisega..."
+Output: {"Customer (CK) Entity": "Circle K Eesti AS", "Supplier Entity": "Eesti Toidutarnijad OÜ", "Effective Date": "2024-04-01", "Expiration Date": null, "Term Type": "Indefinite", "Governing Law": "Estonian law", "Contract Type": "Supply Agreement", "Contract Currency": "EUR", "Payment Term": "Net 30", "Termination for Convenience": "Yes", "Notice Period for Termination for Convenience": "60 days", "Party with the Right to Terminate for Convenience": "Both parties", "source_language": "et", "confidence": "high"}
+
 RULES:
 1. Use null for fields not found or not applicable
 2. Always use YYYY-MM-DD for dates
@@ -258,8 +274,7 @@ Return JSON with the 12 required Sirion fields, plus source_language and confide
                 {"role": "user", "content": user_prompt}
             ],
             response_format={"type": "json_object"},
-            temperature=0.1,
-            max_tokens=1000
+            max_completion_tokens=1000
         )
         
         result = json.loads(response.choices[0].message.content)
@@ -273,6 +288,26 @@ Return JSON with the 12 required Sirion fields, plus source_language and confide
         if "rate" in error_msg.lower() or "429" in error_msg:
             error_msg += " (Rate limit detected)"
         return None, error_msg
+
+
+def validate_critical_fields(metadata):
+    """Validate that critical fields are not empty"""
+    missing_fields = []
+    
+    # Critical fields that should never be empty
+    critical_fields = [
+        'Customer (CK) Entity',
+        'Supplier Entity',
+        'Effective Date',
+        'Contract Type'
+    ]
+    
+    for field in critical_fields:
+        value = metadata.get(field)
+        if not value or value == '' or value == 'null' or value is None:
+            missing_fields.append(field)
+    
+    return missing_fields
 
 
 def process_contract_with_retry(file_info, progress_tracker=None):
