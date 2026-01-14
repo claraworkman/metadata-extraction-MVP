@@ -765,6 +765,17 @@ def process_contracts_from_blob(container_name, output_csv="sirion_metadata.csv"
                 writer.writeheader()
                 writer.writerows(results)
             
+            # Export failed contracts list if any failures
+            if error_count > 0:
+                failed_file = output_csv.replace('.csv', '_failed_contracts.txt')
+                failed_contracts = [r.get('File Name', r.get('Folder Path', 'Unknown')) for r in results if 'Error' in r]
+                with open(failed_file, 'w', encoding='utf-8') as f:
+                    f.write(f"Failed Contracts ({error_count} total)\n")
+                    f.write("="*80 + "\n\n")
+                    for contract in failed_contracts:
+                        f.write(f"{contract}\n")
+                print(f"💾 Failed contracts list: {failed_file}")
+            
             print(f"\n{'='*80}")
             print(f"✅ Extraction Complete!")
             print(f"{'='*80}")
@@ -913,6 +924,17 @@ def process_contracts_to_csv(input_folder, output_csv="sirion_metadata.csv", par
             writer = csv.DictWriter(csvfile, fieldnames=csv_columns, extrasaction='ignore')
             writer.writeheader()
             writer.writerows(results)
+        
+        # Export failed contracts list if any failures
+        if error_count > 0:
+            failed_file = output_csv.replace('.csv', '_failed_contracts.txt')
+            failed_contracts = [r.get('File Name', 'Unknown') for r in results if 'Error' in r]
+            with open(failed_file, 'w', encoding='utf-8') as f:
+                f.write(f"Failed Contracts ({error_count} total)\n")
+                f.write("="*80 + "\n\n")
+                for contract in failed_contracts:
+                    f.write(f"{contract}\n")
+            print(f"💾 Failed contracts list: {failed_file}")
         
         print(f"\n{'='*80}")
         print(f"✅ Extraction Complete!")
